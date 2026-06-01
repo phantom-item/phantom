@@ -3,7 +3,7 @@
 A modern encrypted transport framework with its own `phantom://` protocol,
 built for performance, security, and clean architecture.
 
-> **Status**: Experimental — v0.3.0
+> **Status**: Experimental — v1.0.0
 
 ---
 
