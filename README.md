@@ -10,7 +10,7 @@ built for performance, security, and clean architecture.
 ## One-Line Install
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/phantom-go/phantom/main/docs/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/phantom-item/phantom/main/docs/install.sh)
 ```
 
 > Supports Debian / Ubuntu / CentOS. Must run as root.
