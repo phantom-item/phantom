@@ -1,0 +1,78 @@
+name: Release
+
+on:
+ push:
+   tags:
+     - 'v*'
+
+permissions:
+ contents: write
+
+jobs:
+ build-release:
+   name: Build and Release Phantom
+   runs-on: ubuntu-latest
+   steps:
+     - name: Checkout Code
+       uses: actions/checkout@v4
+
+     - name: Set up Go
+       uses: actions/setup-go@v5
+       with:
+         go-version: '1.24'
+         check-latest: true
+
+     - name: Get Version
+       run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+     - name: Build Matrix
+       run: |
+         PLATFORMS=(
+           "linux/amd64"
+           "linux/arm64"
+           "darwin/amd64"
+           "darwin/arm64"
+           "windows/amd64"
+         )
+
+         mkdir -p dist
+
+         for PLATFORM in "${PLATFORMS[@]}"; do
+           GOOS=${PLATFORM%/*}
+           GOARCH=${PLATFORM#*/}
+
+           BINARY_SERVER="phantom-server"
+           BINARY_CLIENT="phantom-client"
+
+           if [ "$GOOS" = "windows" ]; then
+             BINARY_SERVER="${BINARY_SERVER}.exe"
+             BINARY_CLIENT="${BINARY_CLIENT}.exe"
+           fi
+
+           echo "Building for ${GOOS}/${GOARCH}..."
+
+           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/${BINARY_SERVER}" ./cmd/phantom-server
+           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/${BINARY_CLIENT}" ./cmd/phantom-client
+
+           ARCHIVE_NAME="phantom-${VERSION}-${GOOS}-${GOARCH}"
+           cd dist
+           if [ "$GOOS" = "windows" ]; then
+             zip "../${ARCHIVE_NAME}.zip" "${BINARY_SERVER}" "${BINARY_CLIENT}"
+           else
+             tar -czf "../${ARCHIVE_NAME}.tar.gz" "${BINARY_SERVER}" "${BINARY_CLIENT}"
+           fi
+           cd ..
+
+           rm -rf dist/*
+         done
+
+     - name: Create GitHub Release
+       uses: softprops/action-gh-release@v2
+       with:
+         files: |
+           phantom-*.tar.gz
+           phantom-*.zip
+         draft: false
+         prerelease: false
+       env:
+         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
