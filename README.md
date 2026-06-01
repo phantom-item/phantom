@@ -69,9 +69,9 @@ Re-running the same one-liner on an already-installed server brings up a menu of
 
 | Benchmark | Result |
 |:---|:---|
-| TCP relay throughput | 309 MB/s |
-| Concurrent streams | 21 MB/s |
-| Round-trip latency | ~47 µs |
+| TCP relay throughput | 313 MB/s |
+| Concurrent streams | 22 MB/s |
+| Round-trip latency | ~23 µs |
 
 > Benchmarked on a mid-range x86-64 machine. Results vary by hardware and network conditions.
 
