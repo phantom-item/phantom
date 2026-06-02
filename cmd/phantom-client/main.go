@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -33,10 +32,19 @@ import (
 
 var log = logger.New()
 
+// version is injected at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	useQUIC := flag.Bool("quic", false, "use QUIC transport")
 	configPath := flag.String("config", "config.json", "path to configuration file")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		os.Stdout.WriteString("phantom-client " + version + "\n")
+		return
+	}
 
 	cfg, err := config.LoadFromFile(*configPath)
 	if err != nil {
@@ -44,9 +52,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Sanity check: --quic and transport=ws are mutually exclusive
-	if *useQUIC && cfg.Client.Transport == "ws" {
-		log.Error("--quic flag cannot be combined with transport=ws in config")
+	// QUIC is enabled by either the --quic flag or transport="quic" in
+	// config, so a phantom://...?type=quic URI translated into config
+	// selects QUIC without needing the flag. The flag remains as a
+	// convenient override.
+	quicEnabled := *useQUIC || cfg.Client.Transport == "quic"
+
+	if quicEnabled && cfg.Client.Transport == "ws" {
+		log.Error("QUIC and transport=ws are mutually exclusive")
 		os.Exit(1)
 	}
 
@@ -59,7 +72,7 @@ func main() {
 
 	log.Info("socks5 listening", "addr", cfg.Client.Socks5Addr)
 
-	if *useQUIC {
+	if quicEnabled {
 		runQUIC(cfg, ln)
 	} else {
 		runTCP(cfg, ln)
@@ -180,7 +193,7 @@ func (p *tcpPool) GetSession() (*smux.Session, error) {
 
 func runQUIC(cfg *config.Config, ln net.Listener) {
 	var mu sync.Mutex
-	var qconn quic.Conn
+	var qconn *quic.Conn
 	var err error
 
 	qconn, err = newQUICSession(cfg)
@@ -213,7 +226,7 @@ func runQUIC(cfg *config.Config, ln net.Listener) {
 	}
 }
 
-func newQUICSession(cfg *config.Config) (quic.Conn, error) {
+func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
 	tlsCfg := &tls.Config{
 		// Honour the per-client verify toggle. Same trade-off as dialUTLS:
 		// for IP + self-signed deployments verify must be false; for
@@ -233,7 +246,7 @@ func newQUICSession(cfg *config.Config) (quic.Conn, error) {
 	}
 	qc, err := transport.DialQUIC(cfg.Client.ServerAddr, tlsCfg)
 	if err != nil {
-		return quic.Conn{}, err
+		return nil, err
 	}
 	return qc, nil
 }
@@ -292,7 +305,7 @@ func handleTCPConn(conn net.Conn, session *smux.Session, cfg *config.Config) {
 	relay(conn, stream)
 }
 
-func handleQUICConn(conn net.Conn, qconn quic.Conn, cfg *config.Config) {
+func handleQUICConn(conn net.Conn, qconn *quic.Conn, cfg *config.Config) {
 	defer conn.Close()
 
 	req, err := socks5.Handshake(conn)
@@ -360,11 +373,17 @@ func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
 	}
 	defer udpConn.Close()
 
-	_, localPortStr, _ := net.SplitHostPort(udpConn.LocalAddr().String())
-	var lp int
-	fmt.Sscanf(localPortStr, "%d", &lp)
+	// Closing the tunnel stream on exit guarantees the inbound
+	// ReadUDPPacket goroutine below unblocks promptly rather than
+	// lingering on a blocked read until the parent's deferred
+	// stream.Close() eventually fires.
+	if sc, ok := stream.(io.Closer); ok {
+		defer sc.Close()
+	}
 
-	if err := socks5.SendReply(tcpConn, socks5.RepSuccess, "127.0.0.1", uint16(lp)); err != nil {
+	localPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+	if err := socks5.SendReply(tcpConn, socks5.RepSuccess, "127.0.0.1", uint16(localPort)); err != nil {
 		log.Error("send socks5 udp reply", "err", err)
 		return
 	}
@@ -431,16 +450,25 @@ func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
 }
 
 func relay(a, b io.ReadWriter) {
-	done := make(chan struct{}, 2)
+	// Wait for BOTH directions to complete so neither is truncated when
+	// the caller's deferred Close fires. On finishing one direction,
+	// half-close the peer's write side (when supported) so it observes
+	// EOF and the second copy can drain.
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(b, a)
-		done <- struct{}{}
+		if cw, ok := b.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
 	}()
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(a, b)
-		done <- struct{}{}
+		if cw, ok := a.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
 	}()
-	<-done
+	wg.Wait()
 }
-
-var _ = context.Background

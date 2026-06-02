@@ -26,7 +26,7 @@ type ServerConfig struct {
 	CertFile     string   `json:"cert_file"`
 	KeyFile      string   `json:"key_file"`
 	FallbackAddr string   `json:"fallback_addr"`
-	Transport    string   `json:"transport"` // "tcp" or "ws"
+	Transport    string   `json:"transport"` // "tcp", "quic", or "ws"
 	WSPath       string   `json:"ws_path"`   // e.g., "/api/v1/stream"
 
 	// TrustProxyHeaders controls whether X-Forwarded-For / X-Real-IP
@@ -40,6 +40,17 @@ type ServerConfig struct {
 	// evades the rate limiter and lets the attacker arrange for innocent
 	// IPs to be banned.
 	TrustProxyHeaders bool `json:"trust_proxy_headers"`
+
+	// AllowPrivateTargets disables the SSRF guard that, by default,
+	// refuses to relay to loopback, link-local, private (RFC 1918 /
+	// ULA) and cloud-metadata addresses.
+	//
+	// Default false (guard active). Any client holding a valid password
+	// can otherwise ask the server to dial arbitrary hosts, turning it
+	// into a probe into the server's own internal network and the cloud
+	// metadata endpoint (169.254.169.254). Enable only when the server
+	// is deliberately used to reach a trusted private network.
+	AllowPrivateTargets bool `json:"allow_private_targets"`
 }
 
 type ClientConfig struct {
@@ -48,7 +59,7 @@ type ClientConfig struct {
 	Target         string `json:"target"`
 	Socks5Addr     string `json:"socks5_addr"`
 	TLSFingerprint string `json:"tls_fingerprint"`
-	Transport      string `json:"transport"` // "tcp" or "ws"
+	Transport      string `json:"transport"` // "tcp", "quic", or "ws"
 	WSPath         string `json:"ws_path"`   // e.g., "/api/v1/stream"
 
 	// Verify controls TLS certificate validation against the configured

@@ -9,40 +9,48 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// QUICListener implements the net.Listener interface wrapped around a quic.Listener struct value.
+// QUICListener implements net.Listener around a *quic.Listener.
+//
+// quic-go's Conn, Stream and Listener types embed locks and an internal
+// noCopy marker, so they must never be copied by value. Everything here
+// holds pointers (*quic.Conn, *quic.Stream, *quic.Listener) accordingly.
 type QUICListener struct {
-	quic.Listener
+	ln *quic.Listener
 }
 
-// Accept accepts an incoming QUIC connection and wraps it into a net.Conn compatible QUICNetConn.
+// Accept accepts an incoming QUIC connection and wraps it into a net.Conn
+// compatible *QUICNetConn.
 func (l *QUICListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept(context.Background())
+	conn, err := l.ln.Accept(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	// conn is a pointer (*quic.Conn), dereference it to fit the struct field
-	return &QUICNetConn{Conn: *conn}, nil
+	return &QUICNetConn{Conn: conn}, nil
 }
 
 // Addr returns the listener's network address.
 func (l *QUICListener) Addr() net.Addr {
-	return l.Listener.Addr()
+	return l.ln.Addr()
 }
 
-// QUICNetConn wraps a quic.Conn struct to implement the net.Conn interface.
+// Close closes the underlying QUIC listener.
+func (l *QUICListener) Close() error {
+	return l.ln.Close()
+}
+
+// QUICNetConn wraps a *quic.Conn to implement the net.Conn interface so a
+// QUIC session can flow through the same routing as TCP connections.
 type QUICNetConn struct {
-	quic.Conn
+	Conn *quic.Conn
 }
 
-// Read is a dummy implementation to satisfy net.Conn. Real data transfer should utilize OpenStream/AcceptStream.
-func (c *QUICNetConn) Read(b []byte) (int, error) {
-	return 0, nil
-}
+// Read is a placeholder to satisfy net.Conn. Real data transfer uses
+// OpenStream/AcceptStream on the embedded connection.
+func (c *QUICNetConn) Read(b []byte) (int, error) { return 0, nil }
 
-// Write is a dummy implementation to satisfy net.Conn. Real data transfer should utilize OpenStream/AcceptStream.
-func (c *QUICNetConn) Write(b []byte) (int, error) {
-	return 0, nil
-}
+// Write is a placeholder to satisfy net.Conn. Real data transfer uses
+// OpenStream/AcceptStream on the embedded connection.
+func (c *QUICNetConn) Write(b []byte) (int, error) { return 0, nil }
 
 // Close closes the underlying QUIC connection session.
 func (c *QUICNetConn) Close() error {
@@ -50,59 +58,56 @@ func (c *QUICNetConn) Close() error {
 }
 
 // LocalAddr returns the local network address.
-func (c *QUICNetConn) LocalAddr() net.Addr {
-	return c.Conn.LocalAddr()
-}
+func (c *QUICNetConn) LocalAddr() net.Addr { return c.Conn.LocalAddr() }
 
 // RemoteAddr returns the remote network address.
-func (c *QUICNetConn) RemoteAddr() net.Addr {
-	return c.Conn.RemoteAddr()
-}
+func (c *QUICNetConn) RemoteAddr() net.Addr { return c.Conn.RemoteAddr() }
 
 func (c *QUICNetConn) SetDeadline(t time.Time) error      { return nil }
 func (c *QUICNetConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *QUICNetConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// QUICStreamConn wraps quic.Stream struct value as net.Conn for unified routing down into handleConn.
+// QUICStreamConn wraps a *quic.Stream as net.Conn for unified routing into
+// handleConn. Stream deadlines are real (unlike the session-level conn).
 type QUICStreamConn struct {
-	quic.Stream
-	conn quic.Conn
+	stream *quic.Stream
+	conn   *quic.Conn
 }
+
+func (c *QUICStreamConn) Read(b []byte) (int, error)  { return c.stream.Read(b) }
+func (c *QUICStreamConn) Write(b []byte) (int, error) { return c.stream.Write(b) }
+func (c *QUICStreamConn) Close() error                { return c.stream.Close() }
 
 func (c *QUICStreamConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *QUICStreamConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
-func (c *QUICStreamConn) SetDeadline(t time.Time) error      { return c.Stream.SetDeadline(t) }
-func (c *QUICStreamConn) SetReadDeadline(t time.Time) error  { return c.Stream.SetReadDeadline(t) }
-func (c *QUICStreamConn) SetWriteDeadline(t time.Time) error { return c.Stream.SetWriteDeadline(t) }
+func (c *QUICStreamConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
+func (c *QUICStreamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
+func (c *QUICStreamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
 
-// DialQUIC establishes a client-side QUIC connection session and returns a quic.Conn struct value.
-func DialQUIC(addr string, tlsCfg *tls.Config) (quic.Conn, error) {
+// DialQUIC establishes a client-side QUIC connection and returns the
+// *quic.Conn session.
+func DialQUIC(addr string, tlsCfg *tls.Config) (*quic.Conn, error) {
 	conn, err := quic.DialAddr(context.Background(), addr, tlsCfg, &quic.Config{})
 	if err != nil {
-		return quic.Conn{}, err
+		return nil, err
 	}
-	// conn is a pointer (*quic.Conn), dereference it to return the struct value
-	return *conn, nil
+	return conn, nil
 }
 
-// ListenQUIC starts a server-side QUIC listener wrapped inside the QUICListener struct.
+// ListenQUIC starts a server-side QUIC listener.
 func ListenQUIC(addr string, tlsCfg *tls.Config) (*QUICListener, error) {
 	ln, err := quic.ListenAddr(addr, tlsCfg, &quic.Config{})
 	if err != nil {
 		return nil, err
 	}
-	// Dereference the pointer *ln since the embedded field is a struct value
-	return &QUICListener{Listener: *ln}, nil
+	return &QUICListener{ln: ln}, nil
 }
 
-// QUICConnToNet wraps a raw quic.Conn struct value into a *QUICNetConn for server-side type assertions.
-func QUICConnToNet(conn quic.Conn) *QUICNetConn {
-	return &QUICNetConn{Conn: conn}
-}
-
-// AcceptQUICStreams loops, wraps incoming multiplexed streams into net.Conn, and pushes them to the channel.
-func AcceptQUICStreams(conn quic.Conn) (chan net.Conn, error) {
+// AcceptQUICStreams loops, wraps incoming multiplexed streams into net.Conn,
+// and pushes them to the returned channel. The channel closes when the
+// connection is torn down.
+func AcceptQUICStreams(conn *quic.Conn) chan net.Conn {
 	streams := make(chan net.Conn, 100)
 	go func() {
 		defer close(streams)
@@ -111,9 +116,8 @@ func AcceptQUICStreams(conn quic.Conn) (chan net.Conn, error) {
 			if err != nil {
 				return
 			}
-			// stream is a pointer (*quic.Stream), dereference it into the QUICStreamConn wrapper struct
-			streams <- &QUICStreamConn{Stream: *stream, conn: conn}
+			streams <- &QUICStreamConn{stream: stream, conn: conn}
 		}
 	}()
-	return streams, nil
+	return streams
 }

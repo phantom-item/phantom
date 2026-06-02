@@ -21,7 +21,11 @@ prompt()  { echo -e "${BLUE}[?]${NC} $1"; }
 PHANTOM_VERSION="${PHANTOM_VERSION:-}"
 PHANTOM_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/phantom"
-SERVICE_FILE="/etc/systemd/system/phantom-server.service"
+SERVICE_FILE_TCP="/etc/systemd/system/phantom-server-tcp.service"
+SERVICE_FILE_QUIC="/etc/systemd/system/phantom-server-quic.service"
+# Legacy single-mode unit from <=1.0.x installs. Removed on (re)install
+# and uninstall so it cannot linger and double-bind port 443/tcp.
+SERVICE_FILE_LEGACY="/etc/systemd/system/phantom-server.service"
 
 # ============================================================
 # 0. Fetch latest version
@@ -156,13 +160,27 @@ download_phantom() {
 
     URL="https://github.com/phantom-item/phantom/releases/download/${PHANTOM_VERSION}/phantom-${PHANTOM_VERSION}-linux-${ARCH}.tar.gz"
 
-    if ! curl -sL "$URL" -o /tmp/phantom.tar.gz; then
-        error "Failed to download binary from GitHub. Please check network connection."
+    # -f makes curl return non-zero on HTTP errors (404/5xx); without it a
+    # "Not Found" HTML page would be saved as phantom.tar.gz and the tar
+    # extraction below would fail with a confusing error instead of a clear
+    # download failure.
+    if ! curl -fsSL "$URL" -o /tmp/phantom.tar.gz; then
+        error "Failed to download binary from GitHub ($URL). Check the version tag and network connection."
     fi
 
-    tar -xzf /tmp/phantom.tar.gz -C /tmp
+    if ! tar -xzf /tmp/phantom.tar.gz -C /tmp; then
+        rm -f /tmp/phantom.tar.gz
+        error "Downloaded archive is corrupt or not a gzip tarball."
+    fi
+
+    if [ ! -f /tmp/phantom-server ]; then
+        rm -f /tmp/phantom.tar.gz
+        error "Archive did not contain phantom-server. Aborting to avoid a broken install."
+    fi
+
     mv /tmp/phantom-server "$PHANTOM_DIR/phantom-server"
     chmod +x "$PHANTOM_DIR/phantom-server"
+    rm -f /tmp/phantom.tar.gz /tmp/phantom-client 2>/dev/null || true
     info "phantom-server installed to $PHANTOM_DIR/phantom-server"
 }
 
@@ -201,7 +219,6 @@ EOF
     cat > "$nginx_conf" <<EOF
 server {
     listen 127.0.0.1:8080 default_server;
-    http2 on;
     server_name _;
 
     root $WEB_ROOT;
@@ -308,7 +325,7 @@ configure_firewall() {
     ufw allow "$SSH_PORT/tcp" comment "SSH" > /dev/null
     ufw allow 80/tcp comment "HTTP" > /dev/null
     ufw allow 443/tcp comment "HTTPS" > /dev/null
-    ufw allow 443/udp comment "QUIC" > /dev/null
+    ufw allow 443/udp comment "QUIC (HTTP/3)" > /dev/null
 
     echo ""
     warn "About to enable UFW firewall."
@@ -324,9 +341,18 @@ configure_firewall() {
 # 10. Install systemd service
 # ============================================================
 install_service() {
-    cat > "$SERVICE_FILE" <<EOF
+    # Remove any legacy single-mode unit from a <=1.0.x install so it
+    # does not stay enabled and contend for port 443/tcp with the new
+    # TCP unit below.
+    if [ -f "$SERVICE_FILE_LEGACY" ]; then
+        systemctl stop phantom-server 2>/dev/null || true
+        systemctl disable phantom-server 2>/dev/null || true
+        rm -f "$SERVICE_FILE_LEGACY"
+    fi
+
+    cat > "$SERVICE_FILE_TCP" <<EOF
 [Unit]
-Description=Phantom Proxy Server
+Description=Phantom Proxy Server (TCP/TLS)
 After=network.target nginx.service
 
 [Service]
@@ -340,10 +366,26 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
+    cat > "$SERVICE_FILE_QUIC" <<EOF
+[Unit]
+Description=Phantom Proxy Server (QUIC)
+After=network.target nginx.service
+
+[Service]
+Type=simple
+ExecStart=$PHANTOM_DIR/phantom-server --quic --config $CONFIG_DIR/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
-    systemctl enable phantom-server > /dev/null
-    systemctl restart phantom-server
-    info "phantom-server service installed and started."
+    systemctl enable phantom-server-tcp phantom-server-quic > /dev/null
+    systemctl restart phantom-server-tcp phantom-server-quic
+    info "phantom-server TCP + QUIC services installed and started."
 }
 
 # ============================================================
@@ -359,6 +401,7 @@ print_info() {
     fi
 
     PHANTOM_URI="phantom://${PASSWORD}@${HOST}:443?type=tcp&security=tls&sni=${HOST}&allowInsecure=${ALLOW_INSECURE}#Phantom"
+    PHANTOM_URI_QUIC="phantom://${PASSWORD}@${HOST}:443?type=quic&security=tls&sni=${HOST}&allowInsecure=${ALLOW_INSECURE}#Phantom-QUIC"
     TROJAN_URI="trojan://${PASSWORD}@${HOST}:443?security=tls&sni=${HOST}&allowInsecure=${ALLOW_INSECURE}#Phantom"
 
     echo ""
@@ -368,10 +411,15 @@ print_info() {
     echo ""
     echo "  Server  : $HOST:443"
     echo "  Password: $PASSWORD"
-    echo "  Mode    : TCP / QUIC Dual Stack"
+    echo "  Mode    : TCP + QUIC dual stack (port 443)"
     echo ""
-    echo -e "${GREEN}  Native URI (recommended):${NC}"
+    echo -e "${GREEN}  Native URI — TCP (recommended):${NC}"
     echo "  $PHANTOM_URI"
+    echo ""
+    echo -e "${GREEN}  Native URI — QUIC:${NC}"
+    echo "  $PHANTOM_URI_QUIC"
+    echo -e "${YELLOW}  (for the bundled Go client, set transport=\"quic\" in its${NC}"
+    echo -e "${YELLOW}   config or pass --quic; the type= parameter mirrors this.)${NC}"
     echo ""
     if command -v qrencode &>/dev/null; then
         echo "  [Native QR Code]"
@@ -388,8 +436,8 @@ print_info() {
     echo "============================================================"
     echo ""
     info "Config saved at: $CONFIG_DIR/config.json"
-    info "To reload config: kill -HUP \$(pgrep phantom-server)"
-    info "To check status: systemctl status phantom-server"
+    info "To reload config: systemctl kill -s HUP phantom-server-tcp phantom-server-quic"
+    info "To check status:  systemctl status phantom-server-tcp phantom-server-quic"
     echo ""
 }
 
@@ -489,11 +537,19 @@ PYEOF
 # Tell phantom-server to re-read config.json without dropping live
 # connections. No-op (with a warning) if the service is not running.
 reload_service() {
-    if pgrep phantom-server >/dev/null 2>&1; then
-        kill -HUP "$(pgrep phantom-server)" 2>/dev/null || true
+    local any=0
+    for unit in phantom-server-tcp phantom-server-quic; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            # SIGHUP triggers phantom-server's in-process config reload
+            # (re-reads passwords) without dropping live connections.
+            systemctl kill -s HUP "$unit" 2>/dev/null || true
+            any=1
+        fi
+    done
+    if [ "$any" -eq 1 ]; then
         info "Sent SIGHUP — phantom-server reloaded config."
     else
-        warn "phantom-server is not running. Start it with: systemctl start phantom-server"
+        warn "phantom-server is not running. Start it with: systemctl start phantom-server-tcp phantom-server-quic"
     fi
 }
 
@@ -652,7 +708,8 @@ remove_user() {
 uninstall() {
     warn "This will remove Phantom and all its configuration:"
     warn "  - /usr/local/bin/phantom-server"
-    warn "  - /etc/systemd/system/phantom-server.service"
+    warn "  - $SERVICE_FILE_TCP"
+    warn "  - $SERVICE_FILE_QUIC"
     warn "  - /etc/phantom/ (config and self-signed certificates)"
     read -rp "Are you sure? [y/N]: " CONFIRM
     if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
@@ -660,10 +717,11 @@ uninstall() {
         exit 0
     fi
 
-    systemctl stop phantom-server 2>/dev/null || true
-    systemctl disable phantom-server 2>/dev/null || true
+    # Stop/disable all current and legacy units.
+    systemctl stop phantom-server-tcp phantom-server-quic phantom-server 2>/dev/null || true
+    systemctl disable phantom-server-tcp phantom-server-quic phantom-server 2>/dev/null || true
     rm -f /usr/local/bin/phantom-server
-    rm -f /etc/systemd/system/phantom-server.service
+    rm -f "$SERVICE_FILE_TCP" "$SERVICE_FILE_QUIC" "$SERVICE_FILE_LEGACY"
     rm -rf /etc/phantom/
     systemctl daemon-reload
     info "Phantom has been uninstalled."

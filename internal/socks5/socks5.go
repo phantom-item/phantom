@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,6 +10,9 @@ import (
 
 const (
 	version5 = 0x05
+
+	methodNoAuth       = 0x00
+	methodNoAcceptable = 0xFF
 
 	cmdConnect      = 0x01
 	cmdUDPAssociate = 0x03
@@ -48,7 +52,16 @@ func Handshake(conn net.Conn) (*Request, error) {
 		return nil, err
 	}
 
-	if _, err := conn.Write([]byte{version5, 0x00}); err != nil {
+	// Confirm the client offered the "no authentication" method (0x00)
+	// before we select it. If it did not, reply with 0xFF ("no
+	// acceptable methods") per RFC 1928 and abort, rather than
+	// unconditionally claiming 0x00 was negotiated.
+	if !bytes.Contains(methods, []byte{methodNoAuth}) {
+		_, _ = conn.Write([]byte{version5, methodNoAcceptable})
+		return nil, fmt.Errorf("client offered no acceptable SOCKS5 auth methods")
+	}
+
+	if _, err := conn.Write([]byte{version5, methodNoAuth}); err != nil {
 		return nil, err
 	}
 

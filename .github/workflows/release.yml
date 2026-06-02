@@ -51,8 +51,8 @@ jobs:
 
            echo "Building for ${GOOS}/${GOARCH}..."
 
-           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/${BINARY_SERVER}" ./cmd/phantom-server
-           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "dist/${BINARY_CLIENT}" ./cmd/phantom-client
+           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.version=${VERSION}" -o "dist/${BINARY_SERVER}" ./cmd/phantom-server
+           env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.version=${VERSION}" -o "dist/${BINARY_CLIENT}" ./cmd/phantom-client
 
            ARCHIVE_NAME="phantom-${VERSION}-${GOOS}-${GOARCH}"
            cd dist

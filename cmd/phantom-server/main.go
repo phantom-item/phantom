@@ -37,10 +37,26 @@ import (
 
 var log *slog.Logger
 
+// allowPrivateTargets mirrors cfg.Server.AllowPrivateTargets. Set once at
+// startup; read by dispatchConn's SSRF guard. A package-level value avoids
+// threading the flag through the whole handleSession -> handleConn ->
+// dispatchConn call chain.
+var allowPrivateTargets bool
+
+// version is injected at build time via -ldflags "-X main.version=...".
+// It defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
 	useQUIC := flag.Bool("quic", false, "use QUIC transport")
 	configPath := flag.String("config", "config.json", "path to configuration file")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		os.Stdout.WriteString("phantom-server " + version + "\n")
+		return
+	}
 
 	log = logger.New()
 
@@ -50,10 +66,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Sanity check: --quic and transport=ws are mutually exclusive
-	if *useQUIC && cfg.Server.Transport == "ws" {
-		log.Error("--quic flag cannot be combined with transport=ws in config")
+	// QUIC is enabled by either the --quic flag or transport="quic" in
+	// config, mirroring the client so a single config value drives both
+	// ends' transport.
+	quicEnabled := *useQUIC || cfg.Server.Transport == "quic"
+
+	if quicEnabled && cfg.Server.Transport == "ws" {
+		log.Error("QUIC and transport=ws are mutually exclusive")
 		os.Exit(1)
+	}
+
+	allowPrivateTargets = cfg.Server.AllowPrivateTargets
+	if allowPrivateTargets {
+		log.Warn("SSRF guard disabled (allow_private_targets=true): clients may reach loopback/private/metadata addresses")
 	}
 
 	cert, err := tls.LoadX509KeyPair(cfg.Server.CertFile, cfg.Server.KeyFile)
@@ -68,7 +93,7 @@ func main() {
 	}
 
 	var ln net.Listener
-	if *useQUIC {
+	if quicEnabled {
 		ql, err := transport.ListenQUIC(cfg.Server.Listen, tlsCfg)
 		if err != nil {
 			log.Error("listen quic", "err", err)
@@ -210,17 +235,24 @@ func handleSession(conn net.Conn, authenticator auth.Authenticator, limiter *aut
 
 	remoteAddr := conn.RemoteAddr()
 
-	if limiter.IsBanned(remoteAddr) {
-		log.Warn("banned IP attempted connection, falling back", "addr", remoteAddr)
-		doFallback(conn, remoteAddr, fallbackAddr)
+	// QUIC connections are not byte streams: each carries multiple
+	// multiplexed streams. Detect this before the rewind/parse logic
+	// (which only applies to raw TCP/WS streams) and fan each stream
+	// out to handleConn. Per-stream auth and ban checks happen there.
+	if qconn, ok := conn.(*transport.QUICNetConn); ok {
+		if limiter.IsBanned(remoteAddr) {
+			log.Warn("banned IP attempted QUIC connection", "addr", remoteAddr)
+			return
+		}
+		for stream := range transport.AcceptQUICStreams(qconn.Conn) {
+			go handleConn(stream, authenticator, limiter, fallbackAddr, m)
+		}
 		return
 	}
 
-	if qconn, ok := conn.(*transport.QUICNetConn); ok {
-		streams, _ := transport.AcceptQUICStreams(qconn.Conn)
-		for stream := range streams {
-			go handleConn(stream, authenticator, limiter, fallbackAddr, m)
-		}
+	if limiter.IsBanned(remoteAddr) {
+		log.Warn("banned IP attempted connection, falling back", "addr", remoteAddr)
+		doFallback(conn, remoteAddr, fallbackAddr)
 		return
 	}
 
@@ -317,6 +349,11 @@ func dispatchConn(conn net.Conn, header *protocol.Header, m *metrics.Metrics) {
 	target := header.Request.Address.String()
 	log.Info("relay", "target", target, "user", header.PasswordHash[:8])
 
+	if err := checkRelayTarget(target, allowPrivateTargets); err != nil {
+		log.Warn("blocked relay target", "err", err, "user", header.PasswordHash[:8])
+		return
+	}
+
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	remote, err := dialer.Dial("tcp", target)
 	if err != nil {
@@ -328,18 +365,35 @@ func dispatchConn(conn net.Conn, header *protocol.Header, m *metrics.Metrics) {
 	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 	remote.SetDeadline(time.Now().Add(5 * time.Minute))
 
-	done := make(chan struct{}, 2)
+	// Relay both directions and wait for BOTH to finish. Waiting for only
+	// one (the previous behaviour) let the deferred remote.Close() fire
+	// while the opposite direction still had buffered data in flight,
+	// truncating the tail of responses. When one side reaches EOF we
+	// half-close the peer's write side (if supported) so it observes EOF
+	// and unblocks, then wait for the second copy to drain.
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		n, _ := io.Copy(remote, conn)
 		stats.Sent.Add(uint64(n))
-		done <- struct{}{}
+		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		} else {
+			remote.SetReadDeadline(time.Now())
+		}
 	}()
 	go func() {
+		defer wg.Done()
 		n, _ := io.Copy(conn, remote)
 		stats.Received.Add(uint64(n))
-		done <- struct{}{}
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		} else {
+			conn.SetReadDeadline(time.Now())
+		}
 	}()
-	<-done
+	wg.Wait()
 }
 
 func doFallback(conn net.Conn, remoteAddr net.Addr, fallbackAddr string) {
@@ -365,24 +419,39 @@ func doFallback(conn net.Conn, remoteAddr net.Addr, fallbackAddr string) {
 		io.Copy(conn, remote)
 		done <- struct{}{}
 	}()
+	// Wait for the first direction to finish, then return. The deferred
+	// remote.Close() plus conn's own lifecycle tear down the peer so the
+	// second io.Copy observes a closed connection and its goroutine exits
+	// rather than blocking until process shutdown.
 	<-done
 }
 
 func handleUDPRelay(stream io.ReadWriter) {
 	// sessions: target-string -> outbound UDP socket.
 	//
-	// Concurrency invariant: this map is touched ONLY by the main read
-	// loop below. The per-target goroutines spawned at line ~410 do
-	// NOT access sessions — they hold a captured *net.UDPConn pointer
-	// in their closure. As long as that invariant holds the map needs
-	// no mutex. If a future change adds a second writer (e.g. eviction
-	// based on idle timeout), add sync.Mutex and protect every access.
-	sessions := make(map[string]*net.UDPConn)
+	// Both the main read loop and the per-target reader goroutines touch
+	// shared state (the sessions map and the stream writer), so access is
+	// serialised: sessMu guards the map, writeMu serialises WriteUDPPacket
+	// on the single shared stream. Without writeMu the inbound goroutines
+	// race the main loop's writes and interleave framing on the wire.
+	var (
+		sessMu   sync.Mutex
+		writeMu  sync.Mutex
+		sessions = make(map[string]*net.UDPConn)
+	)
 	defer func() {
+		sessMu.Lock()
 		for _, conn := range sessions {
 			conn.Close()
 		}
+		sessMu.Unlock()
 	}()
+
+	writePacket := func(host string, port uint16, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return protocol.WriteUDPPacket(stream, host, port, payload)
+	}
 
 	if c, ok := stream.(net.Conn); ok {
 		c.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -399,9 +468,15 @@ func handleUDPRelay(stream io.ReadWriter) {
 		}
 
 		target := pkt.Address.String()
+		sessMu.Lock()
 		udpConn, exists := sessions[target]
+		sessMu.Unlock()
 
 		if !exists {
+			if err := checkRelayTarget(target, allowPrivateTargets); err != nil {
+				log.Warn("blocked udp relay target", "err", err)
+				continue
+			}
 			udpAddr, err := net.ResolveUDPAddr("udp", target)
 			if err != nil {
 				log.Error("resolve udp target", "err", err)
@@ -412,28 +487,49 @@ func handleUDPRelay(stream io.ReadWriter) {
 				log.Error("dial udp target", "err", err)
 				continue
 			}
+			sessMu.Lock()
 			sessions[target] = udpConn
+			sessMu.Unlock()
 
-			go func(uConn *net.UDPConn, host string, port uint16) {
+			// Inbound reader. Exits on idle timeout (no traffic for the
+			// deadline window), which both bounds the goroutine lifetime
+			// and evicts the socket from the map so it cannot leak across
+			// a long-lived stream.
+			go func(uConn *net.UDPConn, host string, port uint16, key string) {
 				buf := make([]byte, 65535)
 				for {
 					uConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 					n, err := uConn.Read(buf)
 					if err != nil {
+						sessMu.Lock()
+						if sessions[key] == uConn {
+							delete(sessions, key)
+						}
+						sessMu.Unlock()
+						uConn.Close()
 						return
 					}
-					if err := protocol.WriteUDPPacket(stream, host, port, buf[:n]); err != nil {
+					if err := writePacket(host, port, buf[:n]); err != nil {
+						sessMu.Lock()
+						if sessions[key] == uConn {
+							delete(sessions, key)
+						}
+						sessMu.Unlock()
+						uConn.Close()
 						return
 					}
 				}
-			}(udpConn, pkt.Address.Host, pkt.Address.Port)
+			}(udpConn, pkt.Address.Host, pkt.Address.Port, target)
 		}
 
-		_, err = udpConn.Write(pkt.Payload)
-		if err != nil {
+		if _, err = udpConn.Write(pkt.Payload); err != nil {
 			log.Error("write to udp target", "err", err)
+			sessMu.Lock()
+			if sessions[target] == udpConn {
+				delete(sessions, target)
+			}
+			sessMu.Unlock()
 			udpConn.Close()
-			delete(sessions, target)
 		}
 	}
 }

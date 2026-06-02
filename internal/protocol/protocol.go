@@ -282,6 +282,9 @@ func writeAddress(w io.Writer, addr Address) error {
 			return err
 		}
 	case AtypDomain:
+		if len(addr.Host) == 0 {
+			return fmt.Errorf("empty domain name")
+		}
 		if len(addr.Host) > 255 {
 			return fmt.Errorf("domain name too long")
 		}
@@ -291,6 +294,8 @@ func writeAddress(w io.Writer, addr Address) error {
 		if _, err := w.Write([]byte(addr.Host)); err != nil {
 			return err
 		}
+	default:
+		return fmt.Errorf("unsupported address type: %d", addr.Type)
 	}
 
 	var portBuf [2]byte
