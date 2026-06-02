@@ -1,11 +1,11 @@
 # Phantom
 
-![Version](https://img.shields.io/badge/version-v1.0.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)
+![Version](https://img.shields.io/badge/version-v1.1.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)
 
 A modern encrypted transport framework with its own `phantom://` protocol,
 built for performance, security, and clean architecture.
 
-> **Status**: Stable — v1.0.0
+> **Status**: Stable — v1.1.0
 
 ---
 
