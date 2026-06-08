@@ -6,11 +6,21 @@ import (
 	"time"
 )
 
+// DefaultMaxEntries bounds the number of per-IP failure records the limiter
+// will hold. Without a cap, a flood of failures from many distinct (or
+// spoofed) source IPs grows the map unbounded between the 5-minute cleanup
+// passes, which is a memory-exhaustion vector. When the cap is reached,
+// RecordFailure evicts the least-recently-seen NON-banned records to make
+// room. Banned records are never evicted by this path, so an attacker cannot
+// flush out a legitimate ban by spraying fresh IPs.
+const DefaultMaxEntries = 100_000
+
 // RateLimiter tracks authentication failures per IP and bans abusive sources.
 type RateLimiter struct {
 	mu          sync.Mutex
 	failures    map[string]*failureRecord
 	maxFailures int
+	maxEntries  int
 	window      time.Duration
 	banDuration time.Duration
 	stopChan    chan struct{}
@@ -19,15 +29,27 @@ type RateLimiter struct {
 type failureRecord struct {
 	count      int
 	firstSeen  time.Time
+	lastSeen   time.Time
 	bannedTill time.Time
 }
 
 // NewRateLimiter creates a rate limiter that bans an IP for banDuration
-// after maxFailures failed attempts within window.
+// after maxFailures failed attempts within window. The number of tracked
+// records is capped at DefaultMaxEntries.
 func NewRateLimiter(maxFailures int, window, banDuration time.Duration) *RateLimiter {
+	return NewRateLimiterWithCap(maxFailures, window, banDuration, DefaultMaxEntries)
+}
+
+// NewRateLimiterWithCap is NewRateLimiter with an explicit record cap. A
+// maxEntries <= 0 is treated as DefaultMaxEntries.
+func NewRateLimiterWithCap(maxFailures int, window, banDuration time.Duration, maxEntries int) *RateLimiter {
+	if maxEntries <= 0 {
+		maxEntries = DefaultMaxEntries
+	}
 	rl := &RateLimiter{
 		failures:    make(map[string]*failureRecord),
 		maxFailures: maxFailures,
+		maxEntries:  maxEntries,
 		window:      window,
 		banDuration: banDuration,
 		stopChan:    make(chan struct{}),
@@ -72,9 +94,17 @@ func (rl *RateLimiter) RecordFailure(addr net.Addr) {
 
 	// Reset window if record does not exist, or window expired and IP is not currently banned
 	if !ok || (now.Sub(rec.firstSeen) > rl.window && now.After(rec.bannedTill)) {
-		rl.failures[ip] = &failureRecord{count: 1, firstSeen: now}
+		// Bound memory: before inserting a brand-new key, make room if we
+		// are at the cap. Updating an existing key never grows the map, so
+		// eviction only gates genuine inserts.
+		if !ok && len(rl.failures) >= rl.maxEntries {
+			rl.evictOldestLocked(now)
+		}
+		rl.failures[ip] = &failureRecord{count: 1, firstSeen: now, lastSeen: now}
 		return
 	}
+
+	rec.lastSeen = now
 
 	// Already banned: do nothing, let the ban expire naturally
 	if now.Before(rec.bannedTill) {
@@ -84,6 +114,33 @@ func (rl *RateLimiter) RecordFailure(addr net.Addr) {
 	rec.count++
 	if rec.count >= rl.maxFailures {
 		rec.bannedTill = now.Add(rl.banDuration)
+	}
+}
+
+// evictOldestLocked removes the single least-recently-seen record that is NOT
+// currently banned, to make room under the cap. Callers must hold rl.mu.
+//
+// Banned records are deliberately exempt: evicting them would let an attacker
+// flush an active ban by spamming fresh source IPs. If every record is
+// currently banned (pathological — the whole table is hostile and capped),
+// we leave the map as-is; the cap may be briefly exceeded but the cleanup
+// loop reclaims banned entries once their bans expire.
+func (rl *RateLimiter) evictOldestLocked(now time.Time) {
+	var oldestKey string
+	var oldestSeen time.Time
+	found := false
+	for ip, rec := range rl.failures {
+		if now.Before(rec.bannedTill) {
+			continue // never evict an active ban
+		}
+		if !found || rec.lastSeen.Before(oldestSeen) {
+			oldestKey = ip
+			oldestSeen = rec.lastSeen
+			found = true
+		}
+	}
+	if found {
+		delete(rl.failures, oldestKey)
 	}
 }
 

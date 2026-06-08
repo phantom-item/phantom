@@ -349,15 +349,9 @@ func dispatchConn(conn net.Conn, header *protocol.Header, m *metrics.Metrics) {
 	target := header.Request.Address.String()
 	log.Info("relay", "target", target, "user", header.PasswordHash[:8])
 
-	if err := checkRelayTarget(target, allowPrivateTargets); err != nil {
-		log.Warn("blocked relay target", "err", err, "user", header.PasswordHash[:8])
-		return
-	}
-
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	remote, err := dialer.Dial("tcp", target)
+	remote, err := safeDialTCP(target, allowPrivateTargets, 10*time.Second)
 	if err != nil {
-		log.Error("dial target", "err", err, "target", target)
+		log.Warn("blocked or failed relay target", "err", err, "target", target, "user", header.PasswordHash[:8])
 		return
 	}
 	defer remote.Close()
@@ -473,13 +467,9 @@ func handleUDPRelay(stream io.ReadWriter) {
 		sessMu.Unlock()
 
 		if !exists {
-			if err := checkRelayTarget(target, allowPrivateTargets); err != nil {
-				log.Warn("blocked udp relay target", "err", err)
-				continue
-			}
-			udpAddr, err := net.ResolveUDPAddr("udp", target)
+			udpAddr, err := safeResolveUDP(target, allowPrivateTargets)
 			if err != nil {
-				log.Error("resolve udp target", "err", err)
+				log.Warn("blocked or unresolvable udp relay target", "err", err)
 				continue
 			}
 			udpConn, err = net.DialUDP("udp", nil, udpAddr)

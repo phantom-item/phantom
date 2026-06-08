@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phantom-item/phantom/internal/config"
@@ -122,8 +123,16 @@ func dialUTLS(serverAddr string, fingerprint string, verify bool) (net.Conn, err
 }
 
 func runTCP(cfg *config.Config, ln net.Listener) {
-	// Pass the transport configuration down to the reusable session pool
-	pool := newTCPPool(cfg)
+	pool := newSessionPool(
+		cfg.Client.SessionPoolSize,
+		cfg.Client.SessionGrowthThreshold,
+		func() (pooledSession, error) { return dialSmuxSession(cfg) },
+	)
+	defer pool.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go pool.keepAlive(15*time.Second, stop)
 
 	for {
 		conn, err := ln.Accept()
@@ -133,74 +142,99 @@ func runTCP(cfg *config.Config, ln net.Listener) {
 		}
 
 		go func(c net.Conn) {
-			session, err := pool.GetSession()
+			defer c.Close()
+			stream, err := pool.OpenStream()
 			if err != nil {
-				log.Error("get session", "err", err)
-				c.Close()
+				log.Error("open stream", "err", err)
 				return
 			}
-			handleTCPConn(c, session, cfg)
+			handleClientConn(c, stream, cfg)
 		}(conn)
 	}
 }
 
-// tcpPool manages a reusable smux session over a uTLS (+ optional WebSocket) connection.
-type tcpPool struct {
-	mu      sync.Mutex
-	config  *config.Config
-	session *smux.Session
+// smuxSession adapts *smux.Session to the pooledSession interface.
+type smuxSession struct {
+	sess *smux.Session
+	// underlying transport conn, closed alongside the session.
+	conn    net.Conn
+	streams atomic.Int64
 }
 
-func newTCPPool(cfg *config.Config) *tcpPool {
-	return &tcpPool{config: cfg}
-}
-
-func (p *tcpPool) GetSession() (*smux.Session, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.session != nil && !p.session.IsClosed() {
-		return p.session, nil
+func (s *smuxSession) OpenStream() (io.ReadWriteCloser, error) {
+	st, err := s.sess.OpenStream()
+	if err != nil {
+		return nil, err
 	}
+	s.streams.Add(1)
+	return &countedSmuxStream{Stream: st, parent: s}, nil
+}
+func (s *smuxSession) Healthy() bool   { return s.sess != nil && !s.sess.IsClosed() }
+func (s *smuxSession) NumStreams() int { return int(s.streams.Load()) }
+func (s *smuxSession) Close() error {
+	if s.sess != nil {
+		s.sess.Close()
+	}
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	return nil
+}
 
-	// 1. Establish the underlying uTLS connection first (obfuscates JA3/JA4 fingerprint)
-	conn, err := dialUTLS(p.config.Client.ServerAddr, p.config.Client.TLSFingerprint, p.config.Client.VerifyEnabled())
+// countedSmuxStream decrements the parent's live-stream counter once on Close.
+type countedSmuxStream struct {
+	*smux.Stream
+	parent *smuxSession
+	once   sync.Once
+}
+
+func (c *countedSmuxStream) Close() error {
+	c.once.Do(func() { c.parent.streams.Add(-1) })
+	return c.Stream.Close()
+}
+
+// dialSmuxSession performs the full uTLS (+ optional WebSocket) + smux
+// handshake. It is invoked by the pool with no lock held.
+func dialSmuxSession(cfg *config.Config) (pooledSession, error) {
+	// 1. Establish the underlying uTLS connection (obfuscates JA3/JA4).
+	conn, err := dialUTLS(cfg.Client.ServerAddr, cfg.Client.TLSFingerprint, cfg.Client.VerifyEnabled())
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. If WebSocket transport is enabled, layer it on top of the uTLS connection
-	if p.config.Client.Transport == "ws" {
+	// 2. If WebSocket transport is enabled, layer it on top.
+	if cfg.Client.Transport == "ws" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		wsConn, err := transport.DialWS(ctx, conn, p.config.Client.ServerAddr, p.config.Client.WSPath)
+		wsConn, werr := transport.DialWS(ctx, conn, cfg.Client.ServerAddr, cfg.Client.WSPath)
 		cancel()
-		if err != nil {
-			return nil, err
+		if werr != nil {
+			conn.Close()
+			return nil, werr
 		}
-		conn = wsConn // Seamlessly swap the connection descriptor
+		conn = wsConn
 	}
 
-	// 3. Bind the smux multiplexer onto the established secure tunnel
+	// 3. Bind the smux multiplexer onto the secure tunnel.
 	sess, err := smux.Client(conn, smux.DefaultConfig())
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	p.session = sess
-	return sess, nil
+	return &smuxSession{sess: sess, conn: conn}, nil
 }
 
 func runQUIC(cfg *config.Config, ln net.Listener) {
-	var mu sync.Mutex
-	var qconn *quic.Conn
-	var err error
+	pool := newSessionPool(
+		cfg.Client.SessionPoolSize,
+		cfg.Client.SessionGrowthThreshold,
+		func() (pooledSession, error) { return dialQUICSession(cfg) },
+	)
+	defer pool.Close()
 
-	qconn, err = newQUICSession(cfg)
-	if err != nil {
-		log.Error("create quic session", "err", err)
-		os.Exit(1)
-	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go pool.keepAlive(15*time.Second, stop)
 
 	for {
 		conn, err := ln.Accept()
@@ -209,21 +243,61 @@ func runQUIC(cfg *config.Config, ln net.Listener) {
 			continue
 		}
 
-		mu.Lock()
-		if qconn.Context().Err() != nil {
-			qconn, err = newQUICSession(cfg)
+		go func(c net.Conn) {
+			defer c.Close()
+			stream, err := pool.OpenStream()
 			if err != nil {
-				mu.Unlock()
-				log.Error("recreate quic session", "err", err)
-				conn.Close()
-				continue
+				log.Error("open quic stream", "err", err)
+				return
 			}
-		}
-		currentQconn := qconn
-		mu.Unlock()
-
-		go handleQUICConn(conn, currentQconn, cfg)
+			handleClientConn(c, stream, cfg)
+		}(conn)
 	}
+}
+
+// quicSession adapts a *quic.Conn to the pooledSession interface, tracking the
+// number of live streams it has opened so the pool can make growth decisions.
+type quicSession struct {
+	conn    *quic.Conn
+	streams atomic.Int64
+}
+
+func (s *quicSession) OpenStream() (io.ReadWriteCloser, error) {
+	st, err := s.conn.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	s.streams.Add(1)
+	return &countedStream{Stream: st, parent: s}, nil
+}
+func (s *quicSession) Healthy() bool   { return s.conn != nil && s.conn.Context().Err() == nil }
+func (s *quicSession) NumStreams() int { return int(s.streams.Load()) }
+func (s *quicSession) Close() error {
+	if s.conn != nil {
+		return s.conn.CloseWithError(0, "")
+	}
+	return nil
+}
+
+// countedStream decrements its parent session's stream counter exactly once,
+// on first Close, so NumStreams() reflects live streams.
+type countedStream struct {
+	*quic.Stream
+	parent *quicSession
+	once   sync.Once
+}
+
+func (c *countedStream) Close() error {
+	c.once.Do(func() { c.parent.streams.Add(-1) })
+	return c.Stream.Close()
+}
+
+func dialQUICSession(cfg *config.Config) (pooledSession, error) {
+	qc, err := newQUICSession(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &quicSession{conn: qc}, nil
 }
 
 func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
@@ -251,21 +325,17 @@ func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
 	return qc, nil
 }
 
-func handleTCPConn(conn net.Conn, session *smux.Session, cfg *config.Config) {
-	defer conn.Close()
+// handleClientConn services one accepted SOCKS5 connection over a stream that
+// the pool has already opened. It owns the stream's lifecycle. The transport
+// (TCP/smux, WS, QUIC) is irrelevant here — the stream is just a duplex pipe.
+func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Config) {
+	defer stream.Close()
 
 	req, err := socks5.Handshake(conn)
 	if err != nil {
 		log.Error("socks5 handshake", "err", err)
 		return
 	}
-
-	stream, err := session.OpenStream()
-	if err != nil {
-		log.Error("open stream", "err", err)
-		return
-	}
-	defer stream.Close()
 
 	cmdHost := req.Host
 	cmdPort := req.Port
@@ -296,66 +366,12 @@ func handleTCPConn(conn net.Conn, session *smux.Session, cfg *config.Config) {
 	}
 
 	if req.IsUDP {
-		log.Info("udp associate tcp-mux", "client", conn.RemoteAddr())
+		log.Info("udp associate", "client", conn.RemoteAddr())
 		handleUDP(conn, stream)
 		return
 	}
 
-	log.Info("relay tcp", "host", req.Host, "port", req.Port)
-	relay(conn, stream)
-}
-
-func handleQUICConn(conn net.Conn, qconn *quic.Conn, cfg *config.Config) {
-	defer conn.Close()
-
-	req, err := socks5.Handshake(conn)
-	if err != nil {
-		log.Error("socks5 handshake", "err", err)
-		return
-	}
-
-	stream, err := qconn.OpenStream()
-	if err != nil {
-		log.Error("open quic stream", "err", err)
-		return
-	}
-	defer stream.Close()
-
-	cmdHost := req.Host
-	cmdPort := req.Port
-	cmd := byte(protocol.CmdConnect)
-	if req.IsUDP {
-		cmdHost = "0.0.0.0"
-		cmdPort = 0
-		cmd = protocol.CmdUDP
-	}
-
-	addr, err := protocol.ResolveAddress(cmdHost, cmdPort)
-	if err != nil {
-		log.Error("resolve target address", "err", err)
-		return
-	}
-
-	header := &protocol.Header{
-		PasswordHash: protocol.HashPassword(cfg.Client.Password),
-		Request: protocol.Request{
-			Command: cmd,
-			Address: addr,
-		},
-	}
-
-	if err := protocol.WriteHeader(stream, header); err != nil {
-		log.Error("write header", "err", err)
-		return
-	}
-
-	if req.IsUDP {
-		log.Info("udp associate quic", "client", conn.RemoteAddr())
-		handleUDP(conn, stream)
-		return
-	}
-
-	log.Info("relay quic", "host", req.Host, "port", req.Port)
+	log.Info("relay", "host", req.Host, "port", req.Port)
 	relay(conn, stream)
 }
 

@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"time"
 
@@ -44,13 +45,19 @@ type QUICNetConn struct {
 	Conn *quic.Conn
 }
 
-// Read is a placeholder to satisfy net.Conn. Real data transfer uses
-// OpenStream/AcceptStream on the embedded connection.
-func (c *QUICNetConn) Read(b []byte) (int, error) { return 0, nil }
+// errNoStreamIO is returned by QUICNetConn.Read/Write. A QUICNetConn
+// represents the session, not a byte stream — all real I/O happens on streams
+// obtained via OpenStream/AcceptStream. Returning (0, nil) from Read would
+// violate the io.Reader contract: io.Copy and io.ReadFull treat a (0, nil)
+// read as "try again" and spin at 100% CPU forever. Returning a non-nil error
+// makes any accidental stream-level use fail loudly instead.
+var errNoStreamIO = errors.New("quic: QUICNetConn is a session, not a byte stream; use OpenStream/AcceptStream")
 
-// Write is a placeholder to satisfy net.Conn. Real data transfer uses
-// OpenStream/AcceptStream on the embedded connection.
-func (c *QUICNetConn) Write(b []byte) (int, error) { return 0, nil }
+// Read always errors: a session carries no bytes of its own. See errNoStreamIO.
+func (c *QUICNetConn) Read(b []byte) (int, error) { return 0, errNoStreamIO }
+
+// Write always errors: a session carries no bytes of its own. See errNoStreamIO.
+func (c *QUICNetConn) Write(b []byte) (int, error) { return 0, errNoStreamIO }
 
 // Close closes the underlying QUIC connection session.
 func (c *QUICNetConn) Close() error {

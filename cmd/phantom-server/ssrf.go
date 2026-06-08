@@ -11,8 +11,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"time"
 )
 
 // isDisallowedTargetIP reports whether an IP must not be reached by a relayed
@@ -34,39 +36,87 @@ func isDisallowedTargetIP(ip net.IP) bool {
 	return false
 }
 
-// checkRelayTarget resolves target ("host:port") and returns an error if the
-// guard is active and any resolved address falls in a disallowed range.
+// resolveAllowedIP resolves target ("host:port") to a single concrete IP that
+// has been verified against the SSRF guard, and returns that IP together with
+// the port. The returned ipPort ("ip:port") is what callers MUST hand to Dial
+// — never the original host string.
 //
-// Resolving first and checking every returned address defeats the
-// "domain that resolves to an internal IP" bypass: a literal IP and a
-// hostname pointing at the same address are both rejected.
-func checkRelayTarget(target string, allowPrivate bool) error {
-	if allowPrivate {
-		return nil
-	}
-
-	host, _, err := net.SplitHostPort(target)
+// This is the TOCTOU fix: previously the code resolved-and-checked in
+// checkRelayTarget, then called Dial(target) which resolved a *second* time.
+// Between the two resolutions a hostile DNS server could rebind the name from
+// a public IP (passes the check) to 169.254.169.254 or an RFC1918 address
+// (used by Dial). By resolving exactly once here, verifying that single
+// result, and pinning Dial to the verified IP, the name can no longer point
+// at one address for the check and another for the connection.
+//
+// When allowPrivate is true the guard is disabled and the original target is
+// returned unchanged (Dial resolves as before).
+func resolveAllowedIP(ctx context.Context, target string, allowPrivate bool) (ipPort string, err error) {
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
-		return fmt.Errorf("invalid target %q: %w", target, err)
+		return "", fmt.Errorf("invalid target %q: %w", target, err)
 	}
 
-	// Literal IP: check directly without a DNS lookup.
+	if allowPrivate {
+		return target, nil
+	}
+
+	// Literal IP: verify directly, no DNS lookup, pin to it.
 	if ip := net.ParseIP(host); ip != nil {
 		if isDisallowedTargetIP(ip) {
-			return fmt.Errorf("refusing to relay to disallowed address %s", ip)
+			return "", fmt.Errorf("refusing to relay to disallowed address %s", ip)
 		}
-		return nil
+		return net.JoinHostPort(ip.String(), port), nil
 	}
 
-	// Hostname: resolve and reject if ANY result is disallowed.
-	ips, err := net.LookupIP(host)
+	// Hostname: resolve ONCE, pick the first address that is allowed, and
+	// pin the connection to that exact IP. If ANY returned address is
+	// disallowed we reject the whole name rather than silently picking a
+	// "clean" sibling — a name that resolves to a mix of public and
+	// internal addresses is treated as hostile.
+	resolver := &net.Resolver{}
+	ips, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("resolve target %q: %w", host, err)
+		return "", fmt.Errorf("resolve target %q: %w", host, err)
 	}
-	for _, ip := range ips {
-		if isDisallowedTargetIP(ip) {
-			return fmt.Errorf("refusing to relay to %q (resolves to disallowed address %s)", host, ip)
+	if len(ips) == 0 {
+		return "", fmt.Errorf("resolve target %q: no addresses", host)
+	}
+	for _, ipa := range ips {
+		if isDisallowedTargetIP(ipa.IP) {
+			return "", fmt.Errorf("refusing to relay to %q (resolves to disallowed address %s)", host, ipa.IP)
 		}
 	}
-	return nil
+	// All resolved addresses are allowed; pin to the first.
+	return net.JoinHostPort(ips[0].IP.String(), port), nil
+}
+
+// safeDialTCP resolves+verifies target under the SSRF guard and dials the
+// verified IP. The dialer never sees the original hostname, so the address it
+// connects to is exactly the one that passed the check.
+func safeDialTCP(target string, allowPrivate bool, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ipPort, err := resolveAllowedIP(ctx, target, allowPrivate)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	return dialer.DialContext(ctx, "tcp", ipPort)
+}
+
+// safeResolveUDP resolves+verifies target under the SSRF guard and returns the
+// pinned *net.UDPAddr to dial. As with safeDialTCP the returned address is the
+// verified IP, not a re-resolution of the hostname.
+func safeResolveUDP(target string, allowPrivate bool) (*net.UDPAddr, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ipPort, err := resolveAllowedIP(ctx, target, allowPrivate)
+	if err != nil {
+		return nil, err
+	}
+	return net.ResolveUDPAddr("udp", ipPort)
 }

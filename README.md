@@ -1,13 +1,13 @@
 # Phantom
 
-![Version](https://img.shields.io/badge/version-v1.1.1-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)
+![Version](https://img.shields.io/badge/version-v1.2.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)
 
 A modern encrypted transport framework with its own `phantom://` protocol,
 built for performance, security, and clean architecture.
 
-> **Status**: Stable — v1.1.1
+> **Status**: Stable — v1.2.0
 
------
+---
 
 ## One-Line Install
 
@@ -16,11 +16,10 @@ bash <(curl -sL https://raw.githubusercontent.com/phantom-item/phantom/main/docs
 ```
 
 > Supports Debian / Ubuntu / CentOS. Must run as root.
-> 
+>
 > The installer will automatically:
-> 
 > - Install and configure Nginx as fallback backend
-> - Obtain a Let’s Encrypt TLS certificate (if domain provided)
+> - Obtain a Let's Encrypt TLS certificate (if domain provided)
 > - Generate a random password
 > - Configure UFW firewall
 > - Set up systemd auto-start service
@@ -43,44 +42,40 @@ Re-running the same one-liner on an already-installed server brings up a menu of
 
 `[4]` and `[5]` add or remove individual passwords. Each password is an independent user identity: server-side metrics are tracked per password, so a stolen device can be revoked without affecting anyone else. The server picks up changes via SIGHUP with no connection downtime. `[5]` refuses to remove the last remaining user to avoid locking yourself out.
 
------
+---
 
 ## Features
 
 ### Core Transport
-
 - **Native `phantom://` Protocol** — Purpose-built encrypted transport with clean wire format
 - **Native QUIC Transport** — Eliminates head-of-line blocking, achieves lower latency
 - **WebSocket Transport** — CDN-compatible mode disguising traffic as standard HTTPS WebSocket
 - **Stream Multiplexing** — smux over TLS multiplexes multiple streams over one socket
 
 ### Stealth & Security
-
 - **uTLS Fingerprint Mimicry** — Disguises TLS Client Hello as Chrome / Firefox / Edge / Random
 - **Active Probe Defense** — Invalid connections are transparently forwarded to a real web server
 - **Rate Limiting** — Auto-bans IPs after repeated authentication failures
 - **Stealthy Default Paths** — WebSocket path defaults to `/api/v1/stream` to blend with normal APIs
 
 ### Operations
-
 - **Config Hot Reload** — Add or remove users via `SIGHUP` without restarting
 - **Per-User Traffic Metrics** — Lock-free atomic counters per user
 - **Graceful Shutdown** — Active sessions complete before server exits
 
------
+---
 
 ## Performance
 
-|Benchmark           |Result  |
-|:-------------------|:-------|
-|TCP relay throughput|318 MB/s|
-|Concurrent streams  |22 MB/s |
-|Round-trip latency  |~46 µs  |
-
+| Benchmark | Result |
+|:---|:---|
+| TCP relay throughput | 318 MB/s |
+| Concurrent streams | 22 MB/s |
+| Round-trip latency | ~46 µs |
 
 > Benchmarked on a mid-range x86-64 machine. Results vary by hardware and network conditions.
 
------
+---
 
 ## Configuration
 
@@ -120,7 +115,9 @@ Re-running the same one-liner on an already-installed server brings up a menu of
     "ws_path": "/api/v1/stream",
     "tls_fingerprint": "HelloChrome_Auto",
     "verify": true,
-    "allow_lan_socks5": false
+    "allow_lan_socks5": false,
+    "session_pool_size": 1,
+    "session_growth_threshold": 16
   }
 }
 ```
@@ -136,24 +133,37 @@ Re-running the same one-liner on an already-installed server brings up a menu of
 > a LAN address turns the client into an open proxy for anyone
 > who can reach it.
 
+> `session_pool_size` (default `1`) sets how many underlying
+> transport sessions the client keeps to the server. At `1` there
+> is exactly one connection — the TLS fingerprint appears once and
+> there is no multi-connection signature. At `N > 1` new streams are
+> round-robined across up to `N` sessions for higher throughput and
+> resilience, at the cost of the server seeing several connections
+> from one client. Sessions are opened on demand, never pre-opened.
+
+> `session_growth_threshold` (default `16`) is the per-session
+> concurrent-stream count above which the pool opens another session
+> (only relevant when `session_pool_size > 1`). Larger = fewer
+> connections / stealthier; smaller = more parallelism under load.
+
 ### Transport Modes
 
-|Mode           |Description            |Use Case                       |
-|:--------------|:----------------------|:------------------------------|
-|`tcp` (default)|TLS + smux multiplexing|General use                    |
-|`ws`           |WebSocket over TLS     |CDN deployment, strict networks|
-|`--quic` flag  |Native QUIC transport  |Low-latency, mobile networks   |
+| Mode | Description | Use Case |
+|:---|:---|:---|
+| `tcp` (default) | TLS + smux multiplexing | General use |
+| `ws` | WebSocket over TLS | CDN deployment, strict networks |
+| `--quic` flag | Native QUIC transport | Low-latency, mobile networks |
 
 ### TLS Fingerprints
 
-|Value                       |Description               |
-|:---------------------------|:-------------------------|
-|`HelloChrome_Auto` (default)|Latest Chrome fingerprint |
-|`HelloFirefox_Auto`         |Latest Firefox fingerprint|
-|`HelloEdge_Auto`            |Latest Edge fingerprint   |
-|`HelloRandomized`           |Randomized fingerprint    |
+| Value | Description |
+|:---|:---|
+| `HelloChrome_Auto` (default) | Latest Chrome fingerprint |
+| `HelloFirefox_Auto` | Latest Firefox fingerprint |
+| `HelloEdge_Auto` | Latest Edge fingerprint |
+| `HelloRandomized` | Randomized fingerprint |
 
------
+---
 
 ## Manual Setup (Advanced)
 
@@ -195,27 +205,26 @@ openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
 kill -HUP $(pgrep phantom-server)
 ```
 
------
+---
 
 ## Client Compatibility
 
 Phantom uses its own `phantom://` protocol. For immediate compatibility,
 Phantom server also accepts standard Trojan clients as a temporary bridge.
 
-|Client             |Platform|Native phantom://|Trojan fallback|
-|:------------------|:-------|:----------------|:--------------|
-|Shadowrocket       |iOS     |Pending          |✅              |
-|NekoBox            |Android |Pending          |✅              |
-|v2rayN             |Windows |Pending          |✅              |
-|Clash Meta / Mihomo|All     |Pending          |✅              |
-|sing-box           |All     |Pending          |✅              |
-
+| Client | Platform | Native phantom:// | Trojan fallback |
+|:---|:---|:---|:---|
+| Shadowrocket | iOS | Pending | ✅ |
+| NekoBox | Android | Pending | ✅ |
+| v2rayN | Windows | Pending | ✅ |
+| Clash Meta / Mihomo | All | Pending | ✅ |
+| sing-box | All | Pending | ✅ |
 
 > These clients have not yet added native `phantom://` support.
 > Trojan compatibility is provided as a temporary bridge in the meantime.
 > Client developers are welcome to integrate — see [Protocol Specification](docs/protocol-spec.md).
 
------
+---
 
 ## Documentation
 
@@ -223,11 +232,11 @@ Phantom server also accepts standard Trojan clients as a temporary bridge.
 - [Protocol Specification](docs/protocol-spec.md)
 - [Philosophy](docs/philosophy.md)
 
------
+---
 
 ## License
 
-GNU Affero General Public License v3.0 (AGPL-3.0) — see <LICENSE>.
+GNU Affero General Public License v3.0 (AGPL-3.0) — see [LICENSE](LICENSE).
 
 This is a strong copyleft license. In particular, AGPL §13 extends the
 copyleft obligation to network use: if you run a modified version of this

@@ -84,6 +84,43 @@ type ClientConfig struct {
 	// mistake; operators who legitimately want LAN access opt in
 	// explicitly.
 	AllowLANSocks5 bool `json:"allow_lan_socks5"`
+
+	// SessionPoolSize controls how many underlying transport sessions
+	// (TLS+smux for tcp/ws, or quic.Conn for quic) the client keeps to the
+	// server. Default 1.
+	//
+	// At 1 (the default) behaviour is identical to the original
+	// single-session client: exactly one connection to the server, so the
+	// TLS fingerprint appears exactly once and there is no multi-connection
+	// signature. SOCKS requests still multiplex over that one session via
+	// smux/QUIC streams.
+	//
+	// At N > 1 the client round-robins new streams across up to N sessions
+	// for higher aggregate throughput and resilience (one session dropping
+	// no longer stalls everything). Sessions are NOT pre-opened: the pool
+	// grows on demand, one session at a time, only when the busiest
+	// existing session is carrying enough concurrent streams to justify
+	// another — this avoids the obvious signature of N simultaneous
+	// handshakes at startup.
+	//
+	// Raising this above 1 trades a little stealth (the server sees several
+	// connections from one client) for throughput/availability. Leave it at
+	// 1 if blending in matters more than peak speed.
+	SessionPoolSize int `json:"session_pool_size"`
+
+	// SessionGrowthThreshold is the per-session concurrent-stream count at
+	// or above which the pool will consider opening another session (only
+	// relevant when SessionPoolSize > 1). Default 16.
+	//
+	// This is the stealth/throughput dial:
+	//   - LARGER value  -> the pool packs more streams onto each existing
+	//     session before opening another, so fewer connections appear to
+	//     the server (more stealth, less parallelism).
+	//   - SMALLER value -> the pool opens additional sessions sooner under
+	//     load, raising aggregate throughput at the cost of more visible
+	//     connections.
+	// Ignored when SessionPoolSize == 1 (the pool never grows past one).
+	SessionGrowthThreshold int `json:"session_growth_threshold"`
 }
 
 func LoadFromFile(path string) (*Config, error) {
@@ -141,6 +178,20 @@ func (c *Config) Validate() error {
 		// Default transport to tcp if not specified
 		if c.Client.Transport == "" {
 			c.Client.Transport = "tcp"
+		}
+		// Pool size defaults to 1 (single-session, zero extra signature).
+		if c.Client.SessionPoolSize == 0 {
+			c.Client.SessionPoolSize = 1
+		}
+		if c.Client.SessionPoolSize < 0 {
+			return fmt.Errorf("client.session_pool_size must be >= 1")
+		}
+		// Growth threshold defaults to 16; must be positive if set.
+		if c.Client.SessionGrowthThreshold == 0 {
+			c.Client.SessionGrowthThreshold = 16
+		}
+		if c.Client.SessionGrowthThreshold < 0 {
+			return fmt.Errorf("client.session_growth_threshold must be >= 1")
 		}
 		// Set a stealthy default path if transport is websocket
 		if c.Client.Transport == "ws" && c.Client.WSPath == "" {
