@@ -408,6 +408,14 @@ func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
 			if err != nil {
 				continue
 			}
+			// The peer's ReadUDPPacket rejects payloads above
+			// MaxUDPPayloadLength and treats that as a fatal stream
+			// error. Drop the single oversized datagram here rather
+			// than framing it and killing the entire UDP session.
+			if len(socksReq.Payload) > protocol.MaxUDPPayloadLength {
+				log.Warn("dropping oversized udp datagram", "size", len(socksReq.Payload), "max", protocol.MaxUDPPayloadLength)
+				continue
+			}
 			if err := protocol.WriteUDPPacket(stream, socksReq.Host, socksReq.Port, socksReq.Payload); err != nil {
 				return
 			}

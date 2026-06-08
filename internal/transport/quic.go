@@ -85,10 +85,23 @@ func (c *QUICStreamConn) SetDeadline(t time.Time) error      { return c.stream.S
 func (c *QUICStreamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
 func (c *QUICStreamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
 
+// quicConfig is shared by the dialer and listener so both ends agree on
+// keep-alive and stream limits. Without KeepAlivePeriod an idle tunnel is
+// silently dropped by NAT/firewall middleboxes after ~30s, which on the
+// client surfaces as the session being torn down between requests. The
+// raised MaxIncomingStreams keeps a busy multiplexed client from stalling
+// once it exceeds quic-go's conservative default stream budget.
+func quicConfig() *quic.Config {
+	return &quic.Config{
+		KeepAlivePeriod:    15 * time.Second,
+		MaxIncomingStreams: 1024,
+	}
+}
+
 // DialQUIC establishes a client-side QUIC connection and returns the
 // *quic.Conn session.
 func DialQUIC(addr string, tlsCfg *tls.Config) (*quic.Conn, error) {
-	conn, err := quic.DialAddr(context.Background(), addr, tlsCfg, &quic.Config{})
+	conn, err := quic.DialAddr(context.Background(), addr, tlsCfg, quicConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +110,7 @@ func DialQUIC(addr string, tlsCfg *tls.Config) (*quic.Conn, error) {
 
 // ListenQUIC starts a server-side QUIC listener.
 func ListenQUIC(addr string, tlsCfg *tls.Config) (*QUICListener, error) {
-	ln, err := quic.ListenAddr(addr, tlsCfg, &quic.Config{})
+	ln, err := quic.ListenAddr(addr, tlsCfg, quicConfig())
 	if err != nil {
 		return nil, err
 	}

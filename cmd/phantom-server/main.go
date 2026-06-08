@@ -509,6 +509,14 @@ func handleUDPRelay(stream io.ReadWriter) {
 						uConn.Close()
 						return
 					}
+					// The client's ReadUDPPacket rejects payloads above
+					// MaxUDPPayloadLength as a fatal stream error. Drop
+					// the single oversized datagram rather than framing
+					// it and killing the whole UDP relay goroutine.
+					if n > protocol.MaxUDPPayloadLength {
+						log.Warn("dropping oversized inbound udp datagram", "size", n, "max", protocol.MaxUDPPayloadLength)
+						continue
+					}
 					if err := writePacket(host, port, buf[:n]); err != nil {
 						sessMu.Lock()
 						if sessions[key] == uConn {
