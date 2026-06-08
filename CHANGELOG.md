@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-06-08
+
+### Fixed
+- UDP relay no longer tears down the entire session when a single datagram
+  exceeds MaxUDPPayloadLength (9000 bytes). Oversized datagrams are now dropped
+  individually on both client and server instead of being framed into a packet
+  the peer rejects as a fatal stream error.
+- QUIC dialer and listener now set a 15s KeepAlivePeriod and a raised
+  MaxIncomingStreams, preventing idle tunnels from being silently dropped by
+  NAT/firewall middleboxes and avoiding stream starvation on busy clients.
+
 ## [1.1.0] - 2026-06-02
 
 ### Added
